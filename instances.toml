@@ -1,0 +1,7 @@
+[all]
+memory-max = "4G"
+width = 1280
+height = 720
+
+[client]
+mods = ["radiance"]

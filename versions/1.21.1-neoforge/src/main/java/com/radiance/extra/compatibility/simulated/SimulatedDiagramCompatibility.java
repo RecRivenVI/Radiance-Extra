@@ -1,0 +1,190 @@
+package com.radiance.extra.compatibility.simulated;
+
+import com.mojang.blaze3d.vertex.VertexBuffer;
+import com.radiance.client.render.RenderCaptureContract;
+import com.radiance.extra.compatibility.veil.VeilAdapter;
+import com.radiance.render.contract.DrawTargetContract;
+import dev.ryanhcode.sable.sublevel.ClientSubLevel;
+import dev.ryanhcode.sable.sublevel.render.vanilla.VanillaChunkedSubLevelRenderData;
+import dev.simulated_team.simulated.util.SimpleSubLevelGroupRenderer;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection;
+import net.minecraft.world.phys.AABB;
+import org.lwjgl.system.MemoryUtil;
+
+/**
+ * Original Simulated draw/post/composition with scoped Vulkan resources, never a second renderer.
+ */
+public final class SimulatedDiagramCompatibility {
+    private static final Map<Object, Resources> RESOURCES = new IdentityHashMap<>();
+    private static Context active;
+    private static DiagramSectionMeshes maskMeshes;
+    private static java.util.Set<RenderSection> maskSections;
+
+    private SimulatedDiagramCompatibility() {}
+
+    public static boolean isRenderingDiagram() {
+        return active != null;
+    }
+
+    public static boolean needsSourceMesh() {
+        return active != null || maskSections != null;
+    }
+
+    /** Source shadow targets need the same unmodified raster mesh as source previews. */
+    public static void worldMask(Runnable draw) {
+        if (maskSections != null) throw new IllegalStateException("Nested world mask draw");
+        if (maskMeshes == null) maskMeshes = new DiagramSectionMeshes();
+        var selected =
+                java.util.Collections.newSetFromMap(new IdentityHashMap<RenderSection, Boolean>());
+        maskSections = selected;
+        var recovery = new SimulatedRenderRecovery();
+        recovery.add(
+                () -> {
+                    maskSections = null;
+                    maskMeshes.retain(selected);
+                });
+        recovery.run(draw);
+    }
+
+    public static void closeWorldMask() {
+        if (maskMeshes != null) maskMeshes.close();
+        maskMeshes = null;
+    }
+
+    public static float logicalWidth() {
+        return active == null ? 0 : active.width;
+    }
+
+    public static float logicalHeight() {
+        return active == null ? 0 : active.height;
+    }
+
+    public static <T> T framebuffer(int width, int height) {
+        var window = Minecraft.getInstance().getWindow();
+        return VeilAdapter.framebufferBuilder(
+                DiagramPresentation.pixels(width, window.getWidth(), window.getGuiScaledWidth()),
+                DiagramPresentation.pixels(
+                        height, window.getHeight(), window.getGuiScaledHeight()));
+    }
+
+    public static void draw(
+            ClientSubLevel root, Object fbo, float width, float height, Runnable original) {
+        var resources = RESOURCES.computeIfAbsent(fbo, ignored -> new Resources());
+        var selected = Collections.newSetFromMap(new IdentityHashMap<RenderSection, Boolean>());
+        for (var subLevel : SimpleSubLevelGroupRenderer.getRenderedChain(root))
+            if (subLevel.getRenderData() instanceof VanillaChunkedSubLevelRenderData data)
+                selected.addAll(data.allRenderSections());
+        resources.meshes.retain(selected);
+        // Flush before rebinding: callers may still have paper/GUI vertices pending.
+        Minecraft.getInstance().renderBuffers().bufferSource().endBatch();
+        Context previous = active;
+        var recovery = new SimulatedRenderRecovery();
+        SimulatedFramebufferRecovery.capture(recovery);
+        recovery.add(() -> active = previous);
+        active = new Context(resources, width, height);
+        try (var scope =
+                RenderCaptureContract.enter(
+                        DrawTargetContract.ScopeKind.GUI, "simulated-diagram")) {
+            recovery.run(() -> resources.lightmaps.run(original));
+        }
+    }
+
+    public static VertexBuffer buffer(
+            RenderSection section,
+            RenderType layer,
+            ClientSubLevel subLevel,
+            double x,
+            double y,
+            double z) {
+        if (maskSections != null) {
+            maskSections.add(section);
+            return maskMeshes.buffer(section, layer, subLevel.getLevel());
+        }
+        if (active == null) return section.getBuffer(layer);
+        return active.resources.meshes.buffer(section, layer, subLevel.getLevel());
+    }
+
+    public static void release(Object fbo, Runnable original) {
+        Resources resources = RESOURCES.remove(fbo);
+        var recovery = new SimulatedRenderRecovery();
+        recovery.add(original);
+        recovery.run(
+                () -> {
+                    if (resources != null) resources.close();
+                });
+    }
+
+    /** One readback per initial decoration pass, with all queries using the final post alpha. */
+    public static final class Coverage implements AutoCloseable {
+        private final ByteBuffer pixels;
+        private final int width, height, logicalWidth, logicalHeight;
+
+        public Coverage(Object target, int logicalWidth, int logicalHeight) {
+            this.width = VeilAdapter.framebufferWidth(target);
+            this.height = VeilAdapter.framebufferHeight(target);
+            this.logicalWidth = logicalWidth;
+            this.logicalHeight = logicalHeight;
+            pixels = MemoryUtil.memAlloc(Math.multiplyExact(Math.multiplyExact(width, height), 4));
+            var recovery = new SimulatedRenderRecovery();
+            SimulatedFramebufferRecovery.capture(recovery);
+            try {
+                recovery.run(
+                        () -> {
+                            VeilAdapter.bindFramebufferRead(target);
+                            com.radiance.client.render.AttachmentOperations.readPixels(
+                                    0,
+                                    0,
+                                    width,
+                                    height,
+                                    0x1908,
+                                    0x1401,
+                                    MemoryUtil.memAddress(pixels));
+                        });
+            } catch (RuntimeException | Error failure) {
+                MemoryUtil.memFree(pixels);
+                throw failure;
+            }
+        }
+
+        public boolean occupied(AABB box) {
+            int x = (int) box.minX;
+            int y = (int) (logicalHeight - box.maxY);
+            return DiagramPresentation.occupied(
+                    pixels,
+                    width,
+                    height,
+                    logicalWidth,
+                    logicalHeight,
+                    x,
+                    y,
+                    (int) box.maxX - x,
+                    (int) (logicalHeight - box.minY) - y);
+        }
+
+        @Override
+        public void close() {
+            MemoryUtil.memFree(pixels);
+        }
+    }
+
+    private record Context(Resources resources, float width, float height) {}
+
+    private static final class Resources implements AutoCloseable {
+        final DiagramLightmaps lightmaps = new DiagramLightmaps();
+        final DiagramSectionMeshes meshes = new DiagramSectionMeshes();
+
+        @Override
+        public void close() {
+            var recovery = new SimulatedRenderRecovery();
+            recovery.add(lightmaps::close);
+            recovery.add(meshes::close);
+            recovery.run(() -> {});
+        }
+    }
+}

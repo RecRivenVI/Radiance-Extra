@@ -1,0 +1,23 @@
+Radiance Extra 采用 GPL-3.0-only 许可，见 LICENSE。
+
+本仓库迁入 Radiance 的第三方适配源码，不分发其 Native 运行库。
+
+Raven's Mod Template
+文件：AGENTS.md、.editorconfig、.github/workflows/specification.yml、gradlew、gradlew.bat、gradle/wrapper/、gradle/gradle-daemon-jvm.properties 与 gradle/conventions/
+来源：Raven's Mod Template，https://github.com/RecRivenVI/Ravens-Mod-Template
+版权声明：Copyright (c) 2026 RavenYin
+许可：MIT，licenses/ravens_mod_template-mit.txt
+SPDX-License-Identifier: MIT
+
+Gradle Wrapper
+文件：gradlew、gradlew.bat、gradle/wrapper/gradle-wrapper.jar
+来源：Gradle，https://gradle.org
+版权声明：Copyright 2015 the original author or authors.
+许可：Apache License, Version 2.0，https://www.apache.org/licenses/LICENSE-2.0
+SPDX-License-Identifier: Apache-2.0
+
+Radiance
+文件：versions/1.21.1-neoforge/src/ 中迁入的来源适配与测试
+来源：Radiance，https://github.com/RecRivenVI/Radiance
+许可：GPL-3.0-only，LICENSE
+SPDX-License-Identifier: GPL-3.0-only
