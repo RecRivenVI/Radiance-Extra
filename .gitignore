@@ -1,0 +1,15 @@
+/local.toml
+.gradle/
+.kotlin/
+build/
+out/
+.idea/
+.vscode/
+*.iml
+/instances/**
+!/instances/**/
+/validations/*/instance/
+/validations/*/result/
+*.log
+__pycache__/
+*.pyc

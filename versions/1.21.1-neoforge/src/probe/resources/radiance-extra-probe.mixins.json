@@ -1,0 +1,26 @@
+{
+    "required": true,
+    "minVersion": "0.8",
+    "package": "com.radiance.extra.audit.mixin",
+    "plugin": "com.radiance.extra.audit.mixin.ExtraProbeMixinPlugin",
+    "compatibilityLevel": "JAVA_21",
+    "client": [
+        "TakeoverFlywheelSourceMixin",
+        "SpringMenuSamplerMixin",
+        "SpringMenuMeshMixin",
+        "SpringMenuDrawStateMixin",
+        "LevititePonderDrawMixin",
+        "SpringWorldSegmentMixin",
+        "SpringTwistFixtureMixin",
+        "SpringWorldLoweringMixin",
+        "SpringWorldPbrEndMixin",
+        "SpringSourceCaptureMixin",
+        "ProfileFlywheelBridgeMixin",
+        "ProfileFlywheelFrameMixin",
+        "ProfileSableBridgeMixin",
+        "LevititeStressMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

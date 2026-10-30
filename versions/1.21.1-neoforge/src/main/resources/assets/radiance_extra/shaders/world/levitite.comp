@@ -1,0 +1,121 @@
+#version 460
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Source { uint words[]; } source;
+layout(set=0,binding=1,std430) readonly buffer Parameters { vec4 p[16]; } params;
+struct PositionVertex { vec3 pos; uint flags; };
+struct MaterialVertex {
+    vec3 norm; uint textureId;
+    vec4 colour;
+    vec2 uv; ivec2 overlay;
+    vec2 fieldUv; uint fieldId; float emission;
+    ivec2 light; uint packed; uint emissiveOverlay;
+};
+layout(set=0,binding=2,std430) writeonly buffer Positions { PositionVertex v[]; } positions;
+layout(set=0,binding=3,std430) writeonly buffer Materials { MaterialVertex v[]; } materials;
+layout(set=0,binding=4,std430) writeonly buffer Indices { uint v[]; } indices;
+layout(set=0,binding=5,std430) readonly buffer Contacts { uint w[]; } contacts;
+layout(set=0,binding=6) uniform sampler2D noiseImage;
+layout(set=0,binding=7,r32f) uniform writeonly image2D fieldImage;
+layout(push_constant) uniform Push { uint first; uint vertexOffset; uint indexOffset; uint work; } dispatch;
+shared vec3 points[25];
+shared float opacity[25];
+
+vec3 rotate(vec3 v) { vec4 q=params.p[6]; return v+2.0*cross(q.xyz,cross(q.xyz,v)+q.w*v); }
+vec3 velocity(vec3 p) { return params.p[2].xyz-cross(p,params.p[3].xyz); }
+float fullness(vec3 p) { return (1-exp(-2*length(velocity(p))/params.p[2].w))*params.p[3].w; }
+vec3 drag(vec3 v) {
+    float x2=dot(v,v)/(params.p[2].w*params.p[2].w), q=exp(-1.5*x2);
+    float h0=dot(v,mat3(params.p[10].xyz,params.p[11].xyz,params.p[12].xyz)*v);
+    float h1=dot(v,mat3(params.p[7].xyz,params.p[8].xyz,params.p[9].xyz)*v);
+    float peak=-.446260320297*(h1-h0)+h0;
+    return vec3(q,1-q,max(peak>0?((1-3*x2)*q*(h1-h0)+h0)/peak:0,0));
+}
+vec3 pair(float a,float b,float t) {
+    return textureLod(noiseImage,vec2(2.5*a+.2*t,.3*a+1.5*t),0).rgb
+        -textureLod(noiseImage,vec2(1.5*b+.2*t,.1*b-2.5*t),0).rgb;
+}
+vec3 noise(vec3 p,float t,vec3 scale) {
+    vec3 a=vec3(p.x+.4*p.y-.3*p.z,.2*p.x+p.y-.2*p.z,-.1*p.x-.5*p.y+p.z);
+    vec3 b=vec3(p.x+.2*p.y-.1*p.z,.4*p.x+p.y-.5*p.z,-.3*p.x-.2*p.y+p.z);
+    return vec3(dot(pair(a.z,b.y,t),scale),dot(pair(a.x,b.z,t),scale),dot(pair(a.y,b.x,t),scale));
+}
+vec3 control(vec3 p,float sign) { vec3 v=velocity(p); float len=length(v); return p+v*((1-exp(-len/params.p[2].w))/(len+.001)*sign*.15); }
+vec3 deform(vec3 p) {
+    vec3 v=velocity(p); float speed=length(v), falloff=exp(-speed/params.p[2].w);
+    vec3 n=noise(p/50,params.p[0].w/200,drag(v).yxz*vec3(.4,.3,.2));
+    if(speed>.0001) { vec3 parallel=v*(dot(n,v)/dot(v,v)); n=mix(parallel,n,1-.9*(1-falloff)*(1-falloff)); }
+    return p+n*fullness(p);
+}
+float shimmer(vec3 local) {
+    vec3 n=noise(local/10,params.p[0].w/500,vec3(.7,0,0));
+    // No global-noise evaluation when its source gravity weight is exactly zero.
+    if(params.p[3].w>0) {
+        vec3 global=rotate(local)+params.p[1].xyz;
+        vec3 d=params.p[1].w>0?drag(velocity(local)):vec3(1,0,0);
+        n=mix(n,noise(global/10,params.p[0].w/500,d.yxz*vec3(.7,1,1)),params.p[3].w);
+    }
+    return abs(n.x+n.y+n.z)*max(.3,fullness(local));
+}
+vec3 sourcePos(uint vertex) { uint at=vertex*8; return uintBitsToFloat(uvec3(source.words[at],source.words[at+1],source.words[at+2])); }
+vec2 sourceUv(uint vertex) { uint at=vertex*8+4; return uintBitsToFloat(uvec2(source.words[at],source.words[at+1])); }
+vec4 sourceColour(uint vertex) { uint colour=source.words[vertex*8+3]; return unpackUnorm4x8(colour); }
+vec3 bilerp(vec3 a,vec3 b,vec3 c,vec3 d,vec2 uv) { return mix(mix(a,d,uv.y),mix(b,c,uv.y),uv.x); }
+float clearance(uint grid,vec3 point) {
+    uint head=grid*8, cells=contacts.w[head], nx=contacts.w[head+1], ny=contacts.w[head+2], nz=contacts.w[head+3], boxes=contacts.w[head+4];
+    point-=params.p[14+grid].xyz;
+    ivec3 cell=ivec3(floor(point)); float distance=.25;
+    for(int z=-1;z<=1;z++) for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+        ivec3 p=cell+ivec3(x,y,z);
+        if(any(lessThan(p,ivec3(0))) || any(greaterThanEqual(p,ivec3(nx,ny,nz)))) continue;
+        uint at=cells+uint(p.x+int(nx)*(p.y+int(ny)*p.z))*2;
+        uint first=contacts.w[at], count=contacts.w[at+1];
+        for(uint i=0;i<count;i++) {
+            uint b=boxes+(first+i)*8;
+            vec3 low=uintBitsToFloat(uvec3(contacts.w[b],contacts.w[b+1],contacts.w[b+2]));
+            vec3 high=uintBitsToFloat(uvec3(contacts.w[b+4],contacts.w[b+5],contacts.w[b+6]));
+            vec3 delta=max(max(low-point,point-high),vec3(0)); distance=min(distance,length(delta));
+        }
+    }
+    return smoothstep(-.125,.25,distance);
+}
+void main() {
+    uint invocation=dispatch.first+gl_GlobalInvocationID.x;
+    if(invocation>=dispatch.work) return;
+    uint quad=invocation/64, lane=gl_LocalInvocationID.x, first=quad*4;
+    vec3 a=sourcePos(first), b=sourcePos(first+1), c=sourcePos(first+2), d=sourcePos(first+3);
+    float sign=params.p[4].w;
+    if(lane<25) {
+        vec2 uv=vec2(lane%5,lane/5)/4.0;
+        vec3 local;
+        if(sign==0) local=bilerp(a,b,c,d,uv)+params.p[0].xyz;
+        else local=bilerp(control(a+params.p[0].xyz,sign),control(b+params.p[0].xyz,sign),
+            control(c+params.p[0].xyz,sign),control(d+params.p[0].xyz,sign),uv);
+        if(sign==0) {
+            uint node=quad*25+lane, texel=node*2; int width=int(params.p[13].x);
+            imageStore(fieldImage,ivec2(int(texel)%width,int(texel)/width),vec4(shimmer(local)));
+            imageStore(fieldImage,ivec2(int(texel+1)%width,int(texel+1)/width),vec4(fullness(local)));
+        } else {
+            vec3 deformed=deform(local), world=rotate(deformed*params.p[5].xyz);
+            points[lane]=world;
+            opacity[lane]=fullness(local)*.3*min(clearance(0,deformed),clearance(1,world));
+        }
+    }
+    if(sign==0) return;
+    barrier();
+    uint cell=lane/4, corner=lane%4;
+    const uint xs[4]=uint[4](0,1,1,0), ys[4]=uint[4](0,0,1,1);
+    uint x=cell%4, y=cell/4, node=(x+xs[corner])+(y+ys[corner])*5;
+    vec2 uv=vec2(x+xs[corner],y+ys[corner])/4.0;
+    vec3 n=cross(points[y*5+x+1]-points[y*5+x],points[(y+1)*5+x]-points[y*5+x]);
+    n=dot(n,n)>1e-16?normalize(n):vec3(0,1,0);
+    PositionVertex p; p.pos=points[node]; p.flags=0;
+    MaterialVertex m; m.norm=n; m.textureId=floatBitsToUint(params.p[13].z);
+    m.colour=mix(mix(sourceColour(first),sourceColour(first+3),uv.y),mix(sourceColour(first+1),sourceColour(first+2),uv.y),uv.x);
+    m.colour.a*=opacity[node];
+    m.uv=mix(mix(sourceUv(first),sourceUv(first+3),uv.y),mix(sourceUv(first+1),sourceUv(first+2),uv.y),uv.x);
+    m.overlay=ivec2(0); m.fieldUv=vec2(0); m.fieldId=0x80000000u|floatBitsToUint(params.p[13].w);
+    m.emission=0; m.light=ivec2(0); m.packed=1u|2u|16u|(10u<<8u); m.emissiveOverlay=0;
+    positions.v[dispatch.vertexOffset+invocation]=p; materials.v[dispatch.vertexOffset+invocation]=m;
+    const uint pattern[6]=uint[6](0,1,2,2,3,0);
+    for(uint i=lane;i<96;i+=64) indices.v[dispatch.indexOffset+quad*96+i]=quad*64+(i/6)*4+pattern[i%6];
+}
